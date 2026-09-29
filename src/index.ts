@@ -102,10 +102,14 @@ function errorResponse(message: string) {
 /**
  * Wraps a tool handler with consistent error handling.
  */
-function withErrorHandling<T extends Record<string, unknown>>(
+/* eslint-disable-next-line @typescript-eslint/no-explicit-any --
+   SDK >=1.29 types ToolCallback<Args> as a deferred conditional type, which TypeScript
+   cannot use as a contextual type, so handler params can no longer be inferred here.
+   Args are still validated at runtime by the zod shape passed to server.tool(). */
+function withErrorHandling<T extends Record<string, any>>(
   handler: (params: T) => ReturnType<typeof successResponse>,
   errorPrefix: string
-) {
+): (params: T) => Promise<ReturnType<typeof successResponse>> {
   return async (params: T) => {
     try {
       return handler(params);
