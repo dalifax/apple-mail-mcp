@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **Message timestamps include time of day** - `list-messages` and `search-messages` now show each message's received date as an ISO 8601 timestamp in local time with its UTC offset (e.g. `2026-09-29T17:19:18+01:00`) instead of a locale-dependent date with no time (e.g. `9/29/2026`). This lets callers filter for mail received since a given moment and parse the value regardless of system locale.
+
 ## [1.4.0] - 2026-04-03
 
 ### Fixed

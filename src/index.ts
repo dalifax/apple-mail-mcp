@@ -25,6 +25,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { AppleMailManager } from "@/services/appleMailManager.js";
+import { formatTimestamp } from "@/utils/date.js";
 
 // =============================================================================
 // Shared Validation Schemas
@@ -155,7 +156,7 @@ server.tool(
     const messageList = messages
       .map(
         (m) =>
-          `  - ID: ${m.id} | ${m.dateReceived.toLocaleDateString()} | ${m.subject} (from: ${m.sender}) [${m.isRead ? "read" : "unread"}]`
+          `  - ID: ${m.id} | ${formatTimestamp(m.dateReceived)} | ${m.subject} (from: ${m.sender}) [${m.isRead ? "read" : "unread"}]`
       )
       .join("\n");
 
@@ -211,7 +212,7 @@ server.tool(
     const messageList = messages
       .map(
         (m) =>
-          `  - ID: ${m.id} | ${m.dateReceived.toLocaleDateString()} | ${m.subject} (from: ${m.sender})`
+          `  - ID: ${m.id} | ${formatTimestamp(m.dateReceived)} | ${m.subject} (from: ${m.sender})`
       )
       .join("\n");
 

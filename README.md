@@ -147,6 +147,8 @@ Search for messages matching criteria. Searches all accounts by default.
 | `dateTo` | string | No | End date filter (e.g., "March 1, 2026") |
 | `limit` | number | No | Max results (default: 50) |
 
+**Returns:** List of messages with ID, received timestamp, subject, sender, and read status. Timestamps are ISO 8601 in local time with UTC offset (e.g. `2026-09-29T17:19:18+01:00`).
+
 ---
 
 #### `get-message`
@@ -175,7 +177,7 @@ List messages in a mailbox.
 | `from` | string | No | Filter by sender email address or name |
 | `unreadOnly` | boolean | No | Only show unread messages |
 
-**Returns:** List of messages with ID, date, subject, and sender.
+**Returns:** List of messages with ID, received timestamp (ISO 8601 with UTC offset, e.g. `2026-09-29T17:19:18+01:00`), subject, and sender.
 
 ---
 
