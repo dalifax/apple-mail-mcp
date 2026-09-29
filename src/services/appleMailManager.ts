@@ -35,6 +35,8 @@ import type {
   EmailTemplate,
   SerialEmailRecipient,
   SerialEmailResult,
+  SearchMessagesParams,
+  ListMessagesParams,
 } from "@/types.js";
 
 // =============================================================================
@@ -117,6 +119,116 @@ function parseAppleScriptDate(dateStr: string): Date {
   const normalized = withoutPrefix.replace(" at ", " ");
   const parsed = new Date(normalized);
   return isNaN(parsed.getTime()) ? new Date() : parsed;
+}
+
+/**
+ * Parses a date filter string (already validated by DATE_FILTER_SCHEMA) into a
+ * local Date. Date-only ISO strings ("2026-03-15") are treated as local
+ * midnight rather than UTC midnight, matching the other accepted formats.
+ */
+function parseDateFilter(value: string): Date {
+  const iso = value.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  const date = iso ? new Date(Number(iso[1]), Number(iso[2]) - 1, Number(iso[3])) : new Date(value);
+  if (isNaN(date.getTime())) {
+    throw new Error(`Invalid date filter: "${value}"`);
+  }
+  return date;
+}
+
+/**
+ * Builds AppleScript that sets `varName` to `date` component by component.
+ *
+ * `date "..."` literals are parsed using the system locale, so strings like
+ * "September 21, 2026" fail to compile on e.g. en_IE systems.
+ */
+function buildAppleScriptDate(varName: string, date: Date): string {
+  const seconds = date.getHours() * 3600 + date.getMinutes() * 60 + date.getSeconds();
+  // Reset the day first so changing the month can't overflow (e.g. the 31st -> February).
+  return [
+    `set ${varName} to current date`,
+    `set day of ${varName} to 1`,
+    `set year of ${varName} to ${date.getFullYear()}`,
+    `set month of ${varName} to ${date.getMonth() + 1}`,
+    `set day of ${varName} to ${date.getDate()}`,
+    `set time of ${varName} to ${seconds}`,
+  ].join("\n");
+}
+
+/**
+ * Builds the AppleScript date variables and `whose` conditions for a date range.
+ * A date-only `dateTo` includes that whole day.
+ */
+function buildDateRangeFilter(
+  dateFrom?: string,
+  dateTo?: string
+): { setup: string; conditions: string[] } {
+  const setup: string[] = [];
+  const conditions: string[] = [];
+  if (dateFrom) {
+    setup.push(buildAppleScriptDate("dateFromValue", parseDateFilter(dateFrom)));
+    conditions.push("date received >= dateFromValue");
+  }
+  if (dateTo) {
+    const to = parseDateFilter(dateTo);
+    const wholeDay = to.getHours() === 0 && to.getMinutes() === 0 && to.getSeconds() === 0;
+    if (wholeDay) to.setDate(to.getDate() + 1);
+    setup.push(buildAppleScriptDate("dateToValue", to));
+    conditions.push(wholeDay ? "date received < dateToValue" : "date received <= dateToValue");
+  }
+  return { setup: setup.join("\n"), conditions };
+}
+
+/**
+ * Joins AppleScript filter conditions into a `whose` clause ("" when there are none).
+ */
+function buildWhoseClause(conditions: string[]): string {
+  return conditions.length > 0 ? `whose ${conditions.join(" and ")}` : "";
+}
+
+/**
+ * Builds AppleScript that returns messages offset+1 through offset+limit of
+ * `theMailbox` (optionally narrowed by a `whose` clause) in the format
+ * parseMessageList() expects.
+ *
+ * Properties are fetched in bulk, one Apple Event per property for the whole
+ * range. Reading them message by message costs ~100ms per message, which
+ * pushed listings of large mailboxes past the script timeout.
+ */
+function buildBulkMessageFetch(whoseClause: string, offset: number, limit: number): string {
+  const start = Math.max(0, Math.floor(offset)) + 1;
+  const end = start + Math.max(1, Math.floor(limit)) - 1;
+  const countExpr = whoseClause
+    ? `count of (messages of theMailbox ${whoseClause})`
+    : "count of messages of theMailbox";
+  const rangeExpr = whoseClause
+    ? `messages startIdx thru endIdx of (messages of theMailbox ${whoseClause})`
+    : "messages startIdx thru endIdx of theMailbox";
+
+  return `
+      set totalCount to ${countExpr}
+      set startIdx to ${start}
+      set endIdx to ${end}
+      if endIdx > totalCount then set endIdx to totalCount
+      if startIdx > endIdx then return ""
+      set theMsgs to a reference to (${rangeExpr})
+      set msgIds to id of theMsgs
+      set msgSubjects to subject of theMsgs
+      set msgSenders to sender of theMsgs
+      set msgDates to date received of theMsgs
+      set msgReadFlags to read status of theMsgs
+      set msgFlaggedFlags to flagged status of theMsgs
+      set rows to {}
+      repeat with i from 1 to count of msgIds
+        set msgSubject to item i of msgSubjects
+        if msgSubject is missing value then set msgSubject to ""
+        set msgSender to item i of msgSenders
+        if msgSender is missing value then set msgSender to ""
+        set d to item i of msgDates
+        set end of rows to ((item i of msgIds) as string) & "|||" & msgSubject & "|||" & msgSender & "|||" & ${AS_DATE_TO_STRING} & "|||" & ((item i of msgReadFlags) as string) & "|||" & ((item i of msgFlaggedFlags) as string)
+      end repeat
+      set AppleScript's text item delimiters to "|||ITEM|||"
+      return rows as text
+  `;
 }
 
 /**
@@ -330,35 +442,43 @@ export class AppleMailManager {
     return mailbox;
   }
 
+  /**
+   * Whether the account has a mailbox matching `mailbox` (including aliases).
+   * Assumes it does when the mailbox list can't be fetched.
+   */
+  private hasMailbox(mailbox: string, account: string): boolean {
+    const actualMailboxes = this.getCachedMailboxNames(account);
+    return (
+      actualMailboxes.length === 0 ||
+      actualMailboxes.includes(this.resolveMailbox(mailbox, account))
+    );
+  }
+
   // ===========================================================================
   // Message Operations
   // ===========================================================================
 
   /**
-   * Search for messages matching criteria.
+   * Search for messages matching criteria. All given filters must match.
+   * Searches every mailbox when `mailbox` is omitted, and every account when
+   * `account` is omitted.
    *
-   * @param query - Text to search for in subject or sender
-   * @param mailbox - Mailbox to search in (e.g., "INBOX")
-   * @param account - Account to search in
-   * @param limit - Maximum number of results
+   * @param params - Search filters and result limit (default 50)
    * @returns Array of matching messages
    */
-  searchMessages(
-    query?: string,
-    mailbox?: string,
-    account?: string,
-    limit = 50,
-    dateFrom?: string,
-    dateTo?: string
-  ): Message[] {
+  searchMessages(params: SearchMessagesParams = {}): Message[] {
+    const { query, from, subject, mailbox, account, isRead, isFlagged, dateFrom, dateTo } = params;
+    const limit = params.limit ?? 50;
+
     // If no account specified, search across all accounts
     if (!account) {
       const accounts = this.listAccounts();
       const allMessages: Message[] = [];
       for (const acct of accounts) {
         if (allMessages.length >= limit) break;
+        if (mailbox && !this.hasMailbox(mailbox, acct.name)) continue;
         const remaining = limit - allMessages.length;
-        const msgs = this.searchMessages(query, mailbox, acct.name, remaining, dateFrom, dateTo);
+        const msgs = this.searchMessages({ ...params, account: acct.name, limit: remaining });
         allMessages.push(...msgs);
       }
       return allMessages.slice(0, limit);
@@ -366,28 +486,19 @@ export class AppleMailManager {
 
     const targetAccount = this.resolveAccount(account);
 
-    // Build the search condition
-    let searchCondition = "";
+    // Build a single `whose` clause so Mail does the filtering in one Apple Event.
+    const conditions: string[] = [];
     if (query) {
       const safeQuery = escapeForAppleScript(query);
-      searchCondition = `whose subject contains "${safeQuery}" or sender contains "${safeQuery}"`;
+      conditions.push(`(subject contains "${safeQuery}" or sender contains "${safeQuery}")`);
     }
-
-    // Build date filter AppleScript.
-    // Note: dateFrom/dateTo are already validated by DATE_FILTER_SCHEMA (alphanumeric + safe
-    // punctuation only), so escapeForAppleScript() below is belt-and-suspenders — it won't
-    // alter valid date strings but guards against future schema changes.
-    let dateFilter = "";
-    if (dateFrom || dateTo) {
-      const dateChecks: string[] = [];
-      if (dateFrom) {
-        dateChecks.push(`date received of msg >= date "${escapeForAppleScript(dateFrom)}"`);
-      }
-      if (dateTo) {
-        dateChecks.push(`date received of msg <= date "${escapeForAppleScript(dateTo)}"`);
-      }
-      dateFilter = dateChecks.join(" and ");
-    }
+    if (from) conditions.push(`sender contains "${escapeForAppleScript(from)}"`);
+    if (subject) conditions.push(`subject contains "${escapeForAppleScript(subject)}"`);
+    if (isRead !== undefined) conditions.push(`read status is ${isRead}`);
+    if (isFlagged !== undefined) conditions.push(`flagged status is ${isFlagged}`);
+    const dateRange = buildDateRangeFilter(dateFrom, dateTo);
+    conditions.push(...dateRange.conditions);
+    const whoseClause = buildWhoseClause(conditions);
 
     let searchCommand: string;
 
@@ -396,46 +507,27 @@ export class AppleMailManager {
       const targetMailbox = this.resolveMailbox(mailbox, targetAccount);
 
       searchCommand = `
-      set outputText to ""
+      ${dateRange.setup}
       set theMailbox to mailbox "${escapeForAppleScript(targetMailbox)}"
-      set allMessages to messages of theMailbox ${searchCondition}
-      set msgCount to 0
-      repeat with msg in allMessages
-        if msgCount >= ${limit} then exit repeat
-        try
-          ${dateFilter ? `set msgDate to date received of msg\n          if not (${dateFilter}) then\n            -- skip message outside date range\n          else` : ""}
-          set msgId to id of msg as string
-          set msgSubject to subject of msg
-          set msgSender to sender of msg
-          set d to date received of msg
-          set msgDateStr to ${AS_DATE_TO_STRING}
-          set msgRead to read status of msg as string
-          set msgFlagged to flagged status of msg as string
-          if msgCount > 0 then set outputText to outputText & "|||ITEM|||"
-          set outputText to outputText & msgId & "|||" & msgSubject & "|||" & msgSender & "|||" & msgDateStr & "|||" & msgRead & "|||" & msgFlagged
-          set msgCount to msgCount + 1
-          ${dateFilter ? "end if" : ""}
-        end try
-      end repeat
-      return outputText
+      ${buildBulkMessageFetch(whoseClause, 0, limit)}
     `;
     } else {
       // Search ALL mailboxes — iterate every mailbox in the account, dedup by message ID
       searchCommand = `
+      ${dateRange.setup}
       set outputText to ""
       set msgCount to 0
       set seenIds to {}
       repeat with mb in mailboxes
         if msgCount >= ${limit} then exit repeat
         try
-          set allMessages to messages of mb ${searchCondition}
+          set allMessages to messages of mb ${whoseClause}
           repeat with msg in allMessages
             if msgCount >= ${limit} then exit repeat
             try
               set msgId to id of msg as string
               if seenIds does not contain msgId then
                 set end of seenIds to msgId
-                ${dateFilter ? `set msgDate to date received of msg\n                if not (${dateFilter}) then\n                  -- skip message outside date range\n                else` : ""}
                 set msgSubject to subject of msg
                 set msgSender to sender of msg
                 set d to date received of msg
@@ -445,7 +537,6 @@ export class AppleMailManager {
                 if msgCount > 0 then set outputText to outputText & "|||ITEM|||"
                 set outputText to outputText & msgId & "|||" & msgSubject & "|||" & msgSender & "|||" & msgDateStr & "|||" & msgRead & "|||" & msgFlagged & "|||" & name of mb
                 set msgCount to msgCount + 1
-                ${dateFilter ? "end if" : ""}
               end if
             end try
           end repeat
@@ -458,9 +549,9 @@ export class AppleMailManager {
     const script = buildAccountScopedScript(targetAccount, searchCommand);
     const result = executeAppleScript(script, { timeoutMs: 60000 });
 
+    // Throw rather than return [], so failures and timeouts aren't reported as "No messages found".
     if (!result.success) {
-      console.error(`Failed to search messages: ${result.error}`);
-      return [];
+      throw new Error(`Failed to search messages: ${result.error}`);
     }
 
     if (!result.output.trim()) return [];
@@ -582,28 +673,25 @@ export class AppleMailManager {
   }
 
   /**
-   * List messages in a mailbox.
+   * List messages in a mailbox, or in every mailbox when `mailbox` is omitted.
    *
-   * @param mailbox - Mailbox to list from (default: INBOX)
-   * @param account - Account to list from
-   * @param limit - Maximum number of messages
+   * @param params - Mailbox, account, filters, and pagination (limit defaults to 50)
    * @returns Array of messages
    */
-  listMessages(
-    mailbox?: string,
-    account?: string,
-    limit = 50,
-    from?: string,
-    offset = 0
-  ): Message[] {
+  listMessages(params: ListMessagesParams = {}): Message[] {
+    const { mailbox, account, from, unreadOnly } = params;
+    const limit = params.limit ?? 50;
+    const offset = params.offset ?? 0;
+
     // If no account specified, list across all accounts
     if (!account) {
       const accounts = this.listAccounts();
       const allMessages: Message[] = [];
       for (const acct of accounts) {
         if (allMessages.length >= limit) break;
+        if (mailbox && !this.hasMailbox(mailbox, acct.name)) continue;
         const remaining = limit - allMessages.length;
-        const msgs = this.listMessages(mailbox, acct.name, remaining, from, offset);
+        const msgs = this.listMessages({ ...params, account: acct.name, limit: remaining });
         allMessages.push(...msgs);
       }
       return allMessages.slice(0, limit);
@@ -611,8 +699,10 @@ export class AppleMailManager {
 
     const targetAccount = this.resolveAccount(account);
 
-    const safeFrom = from ? escapeForAppleScript(from) : "";
-    const fromFilter = from ? `whose sender contains "${safeFrom}"` : "";
+    const conditions: string[] = [];
+    if (from) conditions.push(`sender contains "${escapeForAppleScript(from)}"`);
+    if (unreadOnly) conditions.push("read status is false");
+    const whoseClause = buildWhoseClause(conditions);
 
     let listCommand: string;
 
@@ -621,30 +711,8 @@ export class AppleMailManager {
       const targetMailbox = this.resolveMailbox(mailbox, targetAccount);
 
       listCommand = `
-      set outputText to ""
       set theMailbox to mailbox "${escapeForAppleScript(targetMailbox)}"
-      set msgCount to 0
-      set skipped to 0
-      repeat with msg in messages of theMailbox ${fromFilter}
-        if msgCount >= ${limit} then exit repeat
-        try
-          if skipped < ${offset} then
-            set skipped to skipped + 1
-          else
-            set msgId to id of msg as string
-            set msgSubject to subject of msg
-            set msgSender to sender of msg
-            set d to date received of msg
-            set msgDate to ${AS_DATE_TO_STRING}
-            set msgRead to read status of msg as string
-            set msgFlagged to flagged status of msg as string
-            if msgCount > 0 then set outputText to outputText & "|||ITEM|||"
-            set outputText to outputText & msgId & "|||" & msgSubject & "|||" & msgSender & "|||" & msgDate & "|||" & msgRead & "|||" & msgFlagged
-            set msgCount to msgCount + 1
-          end if
-        end try
-      end repeat
-      return outputText
+      ${buildBulkMessageFetch(whoseClause, offset, limit)}
     `;
     } else {
       // List from ALL mailboxes — iterate every mailbox in the account, dedup by message ID
@@ -656,7 +724,7 @@ export class AppleMailManager {
       repeat with mb in mailboxes
         if msgCount >= ${limit} then exit repeat
         try
-          repeat with msg in messages of mb ${fromFilter}
+          repeat with msg in messages of mb ${whoseClause}
             if msgCount >= ${limit} then exit repeat
             try
               set msgId to id of msg as string
@@ -687,9 +755,9 @@ export class AppleMailManager {
     const script = buildAccountScopedScript(targetAccount, listCommand);
     const result = executeAppleScript(script, { timeoutMs: 60000 });
 
+    // Throw rather than return [], so failures and timeouts aren't reported as "No messages found".
     if (!result.success) {
-      console.error(`Failed to list messages: ${result.error}`);
-      return [];
+      throw new Error(`Failed to list messages: ${result.error}`);
     }
 
     if (!result.output.trim()) return [];
@@ -1417,7 +1485,7 @@ export class AppleMailManager {
       set mailboxList to {}
       repeat with mb in mailboxes
         set mbName to name of mb
-        set mbUnread to unread count of mb
+        set mbUnread to count of (messages of mb whose read status is false)
         set mbCount to count of messages of mb
         set end of mailboxList to mbName & "|||" & mbUnread & "|||" & mbCount
       end repeat
@@ -1455,6 +1523,10 @@ export class AppleMailManager {
 
   /**
    * Get unread count for a mailbox.
+   *
+   * Counts messages whose read status is false rather than using Mail's
+   * `unread count` property, which can be far off for IMAP accounts
+   * (e.g. 22 reported vs 294 actual on an iCloud INBOX).
    */
   getUnreadCount(mailbox?: string, account?: string): number {
     const targetAccount = this.resolveAccount(account);
@@ -1463,13 +1535,13 @@ export class AppleMailManager {
     if (mailbox) {
       const targetMailbox = this.resolveMailbox(mailbox, targetAccount);
       const safeMailbox = escapeForAppleScript(targetMailbox);
-      command = `return unread count of mailbox "${safeMailbox}"`;
+      command = `return count of (messages of mailbox "${safeMailbox}" whose read status is false)`;
     } else {
       // Get total unread across all mailboxes
       command = `
         set total to 0
         repeat with mb in mailboxes
-          set total to total + (unread count of mb)
+          set total to total + (count of (messages of mb whose read status is false))
         end repeat
         return total
       `;
@@ -1479,8 +1551,7 @@ export class AppleMailManager {
     const result = executeAppleScript(script);
 
     if (!result.success) {
-      console.error(`Failed to get unread count: ${result.error}`);
-      return 0;
+      throw new Error(`Failed to get unread count: ${result.error}`);
     }
 
     return parseInt(result.output) || 0;

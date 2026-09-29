@@ -125,7 +125,7 @@ function withErrorHandling<T extends Record<string, unknown>>(
 server.tool(
   "search-messages",
   {
-    query: z.string().optional().describe("Text to search for in subject, sender, or content"),
+    query: z.string().optional().describe("Text to search for in subject or sender"),
     from: z.string().optional().describe("Filter by sender email address"),
     subject: z.string().optional().describe("Filter by subject line"),
     mailbox: z
@@ -136,11 +136,13 @@ server.tool(
     isRead: z.boolean().optional().describe("Filter by read status"),
     isFlagged: z.boolean().optional().describe("Filter by flagged status"),
     dateFrom: DATE_FILTER_SCHEMA.describe("Start date filter (e.g., 'January 1, 2026')"),
-    dateTo: DATE_FILTER_SCHEMA.describe("End date filter (e.g., 'March 1, 2026')"),
+    dateTo: DATE_FILTER_SCHEMA.describe(
+      "End date filter, inclusive of that whole day (e.g., 'March 1, 2026')"
+    ),
     limit: z.number().optional().describe("Maximum number of results (default: 50)"),
   },
-  withErrorHandling(({ query, mailbox, account, limit = 50, dateFrom, dateTo }) => {
-    const messages = mailManager.searchMessages(query, mailbox, account, limit, dateFrom, dateTo);
+  withErrorHandling((params) => {
+    const messages = mailManager.searchMessages(params);
 
     if (messages.length === 0) {
       return successResponse("No messages found matching criteria");
@@ -195,8 +197,8 @@ server.tool(
     from: z.string().optional().describe("Filter by sender email address or name"),
     unreadOnly: z.boolean().optional().describe("Only show unread messages"),
   },
-  withErrorHandling(({ mailbox, account, limit = 50, offset = 0, from }) => {
-    const messages = mailManager.listMessages(mailbox, account, limit, from, offset);
+  withErrorHandling((params) => {
+    const messages = mailManager.listMessages(params);
 
     if (messages.length === 0) {
       return successResponse("No messages found");

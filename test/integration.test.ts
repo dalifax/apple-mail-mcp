@@ -186,10 +186,14 @@ describe("live Mail.app operations", { timeout: 120_000 }, () => {
     // Some accounts (e.g. iCloud) may not have a standard INBOX.
     // Find the first account that has messages in INBOX.
     for (const acct of accounts) {
-      const messages = mgr.listMessages("INBOX", acct.name, 1);
-      if (messages.length > 0) {
-        realAccount = acct.name;
-        break;
+      try {
+        const messages = mgr.listMessages({ mailbox: "INBOX", account: acct.name, limit: 1 });
+        if (messages.length > 0) {
+          realAccount = acct.name;
+          break;
+        }
+      } catch {
+        // No INBOX in this account; listMessages throws instead of returning []
       }
     }
 
@@ -198,7 +202,7 @@ describe("live Mail.app operations", { timeout: 120_000 }, () => {
 
   it("lists messages from INBOX", () => {
     expect(realAccount).not.toBeNull();
-    const messages = mgr.listMessages("INBOX", realAccount!, 5);
+    const messages = mgr.listMessages({ mailbox: "INBOX", account: realAccount!, limit: 5 });
     expect(messages.length).toBeGreaterThan(0);
 
     // Capture a real message ID for subsequent tests
@@ -229,17 +233,100 @@ describe("live Mail.app operations", { timeout: 120_000 }, () => {
   });
 
   it("searches messages with date range filter", () => {
-    // This exercises the DATE_FILTER_SCHEMA → AppleScript date literal path
-    const messages = mgr.searchMessages(
-      undefined,
-      "INBOX",
-      realAccount ?? undefined,
-      5,
-      "January 1, 2025",
-      "December 31, 2026"
-    );
-    // May find 0 messages but should not error
-    expect(Array.isArray(messages)).toBe(true);
+    // Month-first dates must work regardless of the system locale (they used to
+    // fail to compile under e.g. en_IE and silently return no results).
+    expect(realMessageId).not.toBeNull();
+    const newest = mgr.listMessages({ mailbox: "INBOX", account: realAccount!, limit: 1 })[0];
+    const day = newest.dateReceived;
+    const label = day.toLocaleDateString("en-US", {
+      month: "long",
+      day: "numeric",
+      year: "numeric",
+    });
+
+    const messages = mgr.searchMessages({
+      mailbox: "INBOX",
+      account: realAccount!,
+      limit: 5,
+      dateFrom: label,
+      dateTo: label,
+    });
+    expect(messages.map((m) => m.id)).toContain(newest.id);
+    for (const m of messages) {
+      expect(m.dateReceived.toDateString()).toBe(day.toDateString());
+    }
+  });
+
+  it("lists only unread messages with unreadOnly", () => {
+    const messages = mgr.listMessages({
+      mailbox: "INBOX",
+      account: realAccount!,
+      limit: 20,
+      unreadOnly: true,
+    });
+    for (const m of messages) {
+      expect(m.isRead).toBe(false);
+    }
+  });
+
+  it("filters search results by read and flagged status", () => {
+    const read = mgr.searchMessages({
+      mailbox: "INBOX",
+      account: realAccount!,
+      limit: 20,
+      isRead: true,
+    });
+    for (const m of read) expect(m.isRead).toBe(true);
+
+    const unflagged = mgr.searchMessages({
+      mailbox: "INBOX",
+      account: realAccount!,
+      limit: 20,
+      isFlagged: false,
+    });
+    for (const m of unflagged) expect(m.isFlagged).toBe(false);
+  });
+
+  it("filters search results by sender and subject", () => {
+    const newest = mgr.listMessages({ mailbox: "INBOX", account: realAccount!, limit: 1 })[0];
+    const subjectWord = newest.subject.split(/\s+/).find((w) => w.length >= 4) ?? newest.subject;
+
+    const bySubject = mgr.searchMessages({
+      mailbox: "INBOX",
+      account: realAccount!,
+      limit: 20,
+      subject: subjectWord,
+    });
+    expect(bySubject.map((m) => m.id)).toContain(newest.id);
+    for (const m of bySubject) expect(m.subject.toLowerCase()).toContain(subjectWord.toLowerCase());
+
+    const bySender = mgr.searchMessages({
+      mailbox: "INBOX",
+      account: realAccount!,
+      limit: 20,
+      from: newest.sender,
+    });
+    expect(bySender.map((m) => m.id)).toContain(newest.id);
+    for (const m of bySender) expect(m.sender).toBe(newest.sender);
+
+    const noMatch = mgr.searchMessages({
+      mailbox: "INBOX",
+      account: realAccount!,
+      subject: "zz-no-such-subject-8f3a1c",
+    });
+    expect(noMatch).toEqual([]);
+  });
+
+  it("paginates list results with offset", () => {
+    const firstTwo = mgr.listMessages({ mailbox: "INBOX", account: realAccount!, limit: 2 });
+    const second = mgr.listMessages({
+      mailbox: "INBOX",
+      account: realAccount!,
+      limit: 1,
+      offset: 1,
+    });
+    if (firstTwo.length < 2) return;
+    expect(second[0].id).toBe(firstTwo[1].id);
   });
 
   it("lists mailboxes for an account", () => {
@@ -252,6 +339,13 @@ describe("live Mail.app operations", { timeout: 120_000 }, () => {
     const count = mgr.getUnreadCount(undefined, realAccount ?? undefined);
     expect(typeof count).toBe("number");
     expect(count).toBeGreaterThanOrEqual(0);
+  });
+
+  it("counts INBOX unread consistently with the messages' read status", () => {
+    const count = mgr.getUnreadCount("INBOX", realAccount!);
+    const sample = mgr.listMessages({ mailbox: "INBOX", account: realAccount!, limit: 200 });
+    const unreadInSample = sample.filter((m) => !m.isRead).length;
+    expect(count).toBeGreaterThanOrEqual(unreadInSample);
   });
 
   it("runs health check", () => {

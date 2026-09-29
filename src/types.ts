@@ -176,16 +176,13 @@ export interface AppleScriptResult {
  * Parameters for searching messages.
  */
 export interface SearchMessagesParams {
-  /** Text to search for (searches subject, sender, content) */
+  /** Text to search for in subject or sender */
   query?: string;
 
-  /** Filter by sender email address */
+  /** Filter by sender (name or email address, substring match) */
   from?: string;
 
-  /** Filter by recipient email address */
-  to?: string;
-
-  /** Filter by subject line */
+  /** Filter by subject line (substring match) */
   subject?: string;
 
   /** Mailbox to search in */
@@ -200,11 +197,11 @@ export interface SearchMessagesParams {
   /** Filter by flagged status */
   isFlagged?: boolean;
 
-  /** Start date for search range */
-  dateFrom?: Date;
+  /** Start of the date range (e.g. "January 1, 2026" or "2026-01-01") */
+  dateFrom?: string;
 
-  /** End date for search range */
-  dateTo?: Date;
+  /** End of the date range; a date without a time includes that whole day */
+  dateTo?: string;
 
   /** Maximum number of results to return */
   limit?: number;
@@ -256,6 +253,12 @@ export interface ListMessagesParams {
 
   /** Maximum number of messages to return */
   limit?: number;
+
+  /** Number of messages to skip (for pagination) */
+  offset?: number;
+
+  /** Filter by sender (name or email address, substring match) */
+  from?: string;
 
   /** Filter to unread messages only */
   unreadOnly?: boolean;
