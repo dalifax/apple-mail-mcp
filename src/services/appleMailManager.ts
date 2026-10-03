@@ -21,6 +21,7 @@ import { executeAppleScript } from "@/utils/applescript.js";
 import type {
   Message,
   MessageContent,
+  MessageHeaders,
   Mailbox,
   Account,
   Attachment,
@@ -669,6 +670,57 @@ export class AppleMailManager {
       subject: parts[0],
       plainText: parts[1],
       htmlContent: htmlContent || undefined,
+    };
+  }
+
+  /**
+   * Get the raw headers of a message, plus the account it is in and that
+   * account's email addresses (used to pick the sender for a mailto unsubscribe).
+   */
+  getMessageHeaders(id: string): MessageHeaders | null {
+    const script = buildAppLevelScript(`
+      try
+        repeat with acct in accounts
+          repeat with mb in mailboxes of acct
+            try
+              set matchingMsgs to (messages of mb whose id is ${Number(id)})
+              if (count of matchingMsgs) > 0 then
+                set msg to item 1 of matchingMsgs
+                set hdrs to all headers of msg
+                set AppleScript's text item delimiters to ","
+                set addrText to (email addresses of acct) as text
+                set AppleScript's text item delimiters to ""
+                return (name of acct) & "|||ADDRESSES|||" & addrText & "|||HEADERS|||" & hdrs
+              end if
+            end try
+          end repeat
+        end repeat
+        return ""
+      on error errMsg
+        return ""
+      end try
+    `);
+
+    const result = executeAppleScript(script, { timeoutMs: 60000 });
+
+    if (!result.success || !result.output.trim()) {
+      console.error(`Failed to get message headers: ${result.error}`);
+      return null;
+    }
+
+    const [accountPart, rest] = result.output.split("|||ADDRESSES|||");
+    if (rest === undefined) return null;
+    const [addressPart, headers] = rest.split("|||HEADERS|||");
+    if (headers === undefined) return null;
+
+    return {
+      id: id.toString(),
+      account: accountPart,
+      accountAddresses: addressPart
+        .split(",")
+        .map((a) => a.trim())
+        .filter(Boolean),
+      headers,
     };
   }
 

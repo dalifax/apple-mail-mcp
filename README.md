@@ -95,6 +95,7 @@ On first use, macOS will ask for permission to automate Mail.app. Click "OK" to 
 | **Move Messages** | Organize into mailboxes (single or batch) |
 | **List Attachments** | View attachment metadata (name, type, size) |
 | **Save Attachment** | Save attachments to disk |
+| **Unsubscribe** | Check and use a message's List-Unsubscribe headers (RFC 8058 one-click, then mailto), DKIM-verified — works for any inbox via a raw message file |
 
 ### Mailbox & Account Management
 
@@ -366,6 +367,30 @@ Save a message attachment to disk.
 | `id` | string | Yes | Message ID |
 | `attachmentName` | string | Yes | Filename of the attachment |
 | `savePath` | string | Yes | Directory to save to |
+
+---
+
+#### `get-unsubscribe-info`
+
+Read-only. Shows which unsubscribe methods a message supports, in order of preference (one-click, mailto, web), and why any are unavailable. Every method requires a passing DKIM signature, reported by a trusted receiver (iCloud or Gmail), that is aligned with the From domain and covers the List-Unsubscribe headers.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | One of | Mail.app message ID |
+| `rawMessagePath` | string | One of | Absolute path to a raw `.eml`, or a JSON file with a base64url `raw` field (e.g. a saved Gmail API RAW response) |
+
+---
+
+#### `unsubscribe-message`
+
+Unsubscribes using the first available automatic method: an RFC 8058 one-click POST (no cookies, redirects not followed, only 2xx counts), then a mailto email. For Mail.app messages the mailto email is sent from the address the message was delivered to; for `rawMessagePath` it is returned for the caller to send from the receiving account. Web-only unsubscribes are never automated.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `id` | string | One of | Mail.app message ID |
+| `rawMessagePath` | string | One of | Raw message file, as above |
+| `method` | `"one-click"` \| `"mailto"` | No | Force a method (default: first available) |
+| `confirm` | `true` | Yes | Must be `true` |
 
 ---
 
