@@ -109,6 +109,16 @@ The `to`, `cc`, and `bcc` parameters must always be arrays:
 - Set `send: false` to save as draft
 - Uses `without opening window` internally — same background-process fix as reply-to-message
 
+### get-unsubscribe-info / unsubscribe-message
+
+- Check first: `get-unsubscribe-info id="..."` lists methods in order (one-click, mailto, web) and why any are unavailable
+- `unsubscribe-message id="..." confirm=true` uses the first automatic method: one-click POST, then mailto
+- Only unsubscribe when the user approved that specific sender. Never for suspected spam or phishing — it confirms the address is live
+- Every method requires a passing DKIM signature (from iCloud or Gmail) aligned with From and covering List-Unsubscribe
+- For mail outside Mail.app (e.g. Gmail), pass `rawMessagePath` — a `.eml` or a JSON file with a base64url `raw` field (a saved Gmail API RAW response works). mailto is then returned, not sent: send it from the account that received the message
+- "web" means a page a person must finish; the tools never automate it
+- iCloud message IDs change when a message is moved, so look the message up again before unsubscribing
+
 ### Multi-account
 
 - Default account is Mail.app's configured default send account

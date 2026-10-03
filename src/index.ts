@@ -25,6 +25,13 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { AppleMailManager } from "@/services/appleMailManager.js";
+import {
+  analyzeUnsubscribe,
+  formatUnsubscribeAnalysis,
+  performOneClickUnsubscribe,
+  pickSenderAddress,
+  readRawMessageFile,
+} from "@/utils/unsubscribe.js";
 
 // =============================================================================
 // Shared Validation Schemas
@@ -107,12 +114,14 @@ function errorResponse(message: string) {
    cannot use as a contextual type, so handler params can no longer be inferred here.
    Args are still validated at runtime by the zod shape passed to server.tool(). */
 function withErrorHandling<T extends Record<string, any>>(
-  handler: (params: T) => ReturnType<typeof successResponse>,
+  handler: (
+    params: T
+  ) => ReturnType<typeof successResponse> | Promise<ReturnType<typeof successResponse>>,
   errorPrefix: string
 ): (params: T) => Promise<ReturnType<typeof successResponse>> {
   return async (params: T) => {
     try {
-      return handler(params);
+      return await handler(params);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown error";
       return errorResponse(`${errorPrefix}: ${message}`);
@@ -664,6 +673,123 @@ server.tool(
 
     return successResponse(`Attachment "${attachmentName}" saved to ${savePath}`);
   }, "Error saving attachment")
+);
+
+// =============================================================================
+// Unsubscribe Tools
+// =============================================================================
+
+/** Where to read a message's headers from: Mail.app, or a raw file from any inbox. */
+const UNSUBSCRIBE_SOURCE_SHAPE = {
+  id: MESSAGE_ID_SCHEMA.optional().describe("Mail.app message ID"),
+  rawMessagePath: z
+    .string()
+    .optional()
+    .describe(
+      "Absolute path to a raw RFC 822 message (.eml), or to a JSON file with a base64url `raw` field " +
+        "(e.g. a saved Gmail API RAW response). Use for mail that isn't in Mail.app."
+    ),
+};
+
+/**
+ * Loads the raw headers for an unsubscribe tool call.
+ * Returns the Mail.app message details too when the source is a message ID.
+ */
+function loadUnsubscribeSource(params: { id?: string; rawMessagePath?: string }) {
+  if (Boolean(params.id) === Boolean(params.rawMessagePath)) {
+    throw new Error("Provide exactly one of id or rawMessagePath");
+  }
+  if (params.rawMessagePath) {
+    return { raw: readRawMessageFile(params.rawMessagePath), message: null };
+  }
+  const message = mailManager.getMessageHeaders(params.id as string);
+  if (!message) {
+    throw new Error(`Message with ID "${params.id}" not found`);
+  }
+  return { raw: message.headers, message };
+}
+
+// --- get-unsubscribe-info ---
+
+server.tool(
+  "get-unsubscribe-info",
+  {
+    ...UNSUBSCRIBE_SOURCE_SHAPE,
+  },
+  withErrorHandling((params) => {
+    const { raw } = loadUnsubscribeSource(params);
+    return successResponse(formatUnsubscribeAnalysis(analyzeUnsubscribe(raw)));
+  }, "Error reading unsubscribe info")
+);
+
+// --- unsubscribe-message ---
+
+server.tool(
+  "unsubscribe-message",
+  {
+    ...UNSUBSCRIBE_SOURCE_SHAPE,
+    method: z
+      .enum(["one-click", "mailto"])
+      .optional()
+      .describe("Method to use. Omit to use the first available: one-click, then mailto."),
+    confirm: z.literal(true).describe("Must be true: this contacts the sender to unsubscribe"),
+  },
+  withErrorHandling(async (params) => {
+    const { raw, message } = loadUnsubscribeSource(params);
+    const analysis = analyzeUnsubscribe(raw);
+    const automatic = analysis.methods.filter((m) => m === "one-click" || m === "mailto");
+    const method = params.method ?? automatic[0];
+
+    if (!method || !automatic.includes(method)) {
+      const next = analysis.methods.includes("web")
+        ? `\nOnly a web page is available; a person must finish it: ${analysis.httpsUrl}`
+        : "";
+      return errorResponse(
+        `${method ? `Method "${method}"` : "No automatic method"} is not available.\n` +
+          formatUnsubscribeAnalysis(analysis) +
+          next
+      );
+    }
+
+    if (method === "one-click") {
+      const result = await performOneClickUnsubscribe(analysis.httpsUrl as string);
+      if (!result.ok) {
+        return errorResponse(`One-click unsubscribe failed: ${result.error}`);
+      }
+      return successResponse(
+        `Unsubscribed via one-click (HTTP ${result.status}) from ${analysis.from}`
+      );
+    }
+
+    // mailto
+    const target = analysis.mailto as NonNullable<typeof analysis.mailto>;
+    if (!message) {
+      // The raw file could be from any inbox, so the caller must send from the
+      // account that received it.
+      return successResponse(
+        `Not sent. Send this unsubscribe email from the account that received the message:\n` +
+          `To: ${target.address}\nSubject: ${target.subject}\nBody: ${target.body}`
+      );
+    }
+    const sender = pickSenderAddress(raw, message.accountAddresses);
+    if (!sender) {
+      return errorResponse(`No email address found for account "${message.account}"`);
+    }
+    const sent = mailManager.sendEmail(
+      [target.address],
+      target.subject,
+      target.body,
+      undefined,
+      undefined,
+      sender
+    );
+    if (!sent) {
+      return errorResponse("Failed to send the unsubscribe email. Check Mail.app configuration.");
+    }
+    return successResponse(
+      `Unsubscribe email sent from ${sender} to ${target.address} for ${analysis.from}`
+    );
+  }, "Error unsubscribing")
 );
 
 // =============================================================================

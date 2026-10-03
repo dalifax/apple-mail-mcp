@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Unsubscribe tools** — `get-unsubscribe-info` (read-only) and `unsubscribe-message` use a message's List-Unsubscribe headers: RFC 8058 one-click POST first, then a mailto email. Every method requires a passing, From-aligned DKIM signature from a trusted receiver (iCloud or Gmail) that covers the unsubscribe headers. Both tools accept a Mail.app message ID or a raw message file (`.eml`, or JSON with a base64url `raw` field such as a Gmail API RAW response), so the same logic works for any inbox.
+
+### Changed
+- `withErrorHandling` now accepts async handlers.
+
 ## [1.4.0] - 2026-04-03
 
 ### Fixed
