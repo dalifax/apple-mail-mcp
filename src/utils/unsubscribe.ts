@@ -125,11 +125,87 @@ export function parseHeaders(raw: string): Map<string, string[]> {
   return headers;
 }
 
-/** Extracts the bare address from a From header value. */
+/**
+ * A plain addr-spec: dot-atoms either side of a single @, with no whitespace,
+ * control characters or RFC 5322 specials. Rules out quoted local parts,
+ * routes, domain literals and empty labels.
+ */
+const ATOM = String.raw`[^\s\x00-\x1f\x7f"(),.:;<>@[\\\]]+`;
+const DOT_ATOM = String.raw`${ATOM}(?:\.${ATOM})*`;
+const PLAIN_ADDRESS = new RegExp(`^${DOT_ATOM}@${DOT_ATOM}$`);
+
+/**
+ * Returns the index that closes the quoted string or comment opening at
+ * `start`, or -1 if it is never closed. A backslash escapes the next
+ * character, and comments nest.
+ */
+function closingIndex(value: string, start: number): number {
+  const open = value[start];
+  let depth = 0;
+  for (let i = start; i < value.length; i++) {
+    const c = value[i];
+    if (c === "\\") {
+      i++;
+    } else if (open === '"') {
+      if (c === '"' && i > start) return i;
+    } else if (c === "(") {
+      depth++;
+    } else if (c === ")" && --depth === 0) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Extracts the sender's address from a From header value, parsed as a single
+ * RFC 5322 mailbox. Quoted strings and comments are skipped, and the address
+ * comes from the last <...> outside them, so a display name such as
+ * `"<news@bank.example>" <attacker@evil.example>` can't hide the real sender.
+ *
+ * Returns null for a group, several mailboxes, malformed syntax, or anything
+ * that isn't a plain address.
+ */
 export function extractAddress(from: string): string | null {
-  const bracketed = from.match(/<([^>]+)>/);
-  const candidate = (bracketed ? bracketed[1] : from).trim();
-  return /^[^\s@<>]+@[^\s@<>]+$/.test(candidate) ? candidate.toLowerCase() : null;
+  let address: string | null = null; // contents of the last <...>
+  let text = ""; // text outside quotes and <...> since then, comments as spaces
+  let quoted = false; // a quoted string since then
+
+  for (let i = 0; i < from.length; i++) {
+    const c = from[i];
+    if (c === '"' || c === "(") {
+      const end = closingIndex(from, i);
+      if (end === -1) return null;
+      if (c === '"') quoted = true;
+      else text += " ";
+      i = end;
+    } else if (c === "<") {
+      const end = from.indexOf(">", i + 1);
+      if (end === -1) return null;
+      address = from.slice(i + 1, end);
+      // Quotes, comments or nesting here would make the end ambiguous
+      if (/[<"()\\]/.test(address)) return null;
+      text = "";
+      quoted = false;
+      i = end;
+    } else if (",:;>)\\".includes(c)) {
+      // A list, a group, or stray syntax that parsers read differently
+      return null;
+    } else {
+      text += c;
+    }
+  }
+
+  if (address !== null) {
+    // Only whitespace and comments may follow the angle-addr
+    if (quoted || text.trim()) return null;
+  } else {
+    // No angle brackets: the whole value must be a bare addr-spec
+    if (quoted) return null;
+    address = text;
+  }
+  address = address.trim();
+  return PLAIN_ADDRESS.test(address) ? address.toLowerCase() : null;
 }
 
 /** Returns the domain part of an email address. */
