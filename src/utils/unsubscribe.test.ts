@@ -113,6 +113,70 @@ describe("extractAddress", () => {
   it("returns null for unparseable values", () => {
     expect(extractAddress("Undisclosed recipients")).toBeNull();
   });
+
+  it("ignores an address hidden in the display name", () => {
+    expect(extractAddress('"<news@bank.example> Updates" <attacker@evil.example>')).toBe(
+      "attacker@evil.example"
+    );
+    expect(extractAddress("<news@bank.example> Updates <attacker@evil.example>")).toBe(
+      "attacker@evil.example"
+    );
+    expect(extractAddress("news@bank.example <attacker@evil.example>")).toBe(
+      "attacker@evil.example"
+    );
+  });
+
+  it("skips quoted display names with escaped quotes and brackets", () => {
+    expect(extractAddress('"Bank \\"<news@bank.example>\\" \\\\" <attacker@evil.example>')).toBe(
+      "attacker@evil.example"
+    );
+    expect(extractAddress('"a>b, c:d; (e)" <attacker@evil.example>')).toBe("attacker@evil.example");
+  });
+
+  it("skips comments, including nested ones and ones holding addresses", () => {
+    expect(extractAddress("(<news@bank.example>) <attacker@evil.example>")).toBe(
+      "attacker@evil.example"
+    );
+    expect(extractAddress("Sender <attacker@evil.example> (via <news@bank.example>)")).toBe(
+      "attacker@evil.example"
+    );
+    expect(extractAddress("attacker@evil.example (Bank (\\) <news@bank.example>) Updates)")).toBe(
+      "attacker@evil.example"
+    );
+  });
+
+  it("refuses multiple mailboxes and groups", () => {
+    expect(extractAddress("a@x.example, b@y.example")).toBeNull();
+    expect(extractAddress('"A" <a@x.example>, "B" <b@y.example>')).toBeNull();
+    expect(extractAddress("Team: a@x.example, b@y.example;")).toBeNull();
+    expect(extractAddress("Bank: <news@bank.example>;")).toBeNull();
+    expect(extractAddress("undisclosed-recipients:;")).toBeNull();
+  });
+
+  it("refuses malformed or non-plain addresses", () => {
+    expect(extractAddress('"Unterminated <news@bank.example>')).toBeNull();
+    expect(extractAddress("(Unterminated <news@bank.example>")).toBeNull();
+    expect(extractAddress("Name <news@bank.example")).toBeNull();
+    expect(extractAddress("Name <news@bank.example> attacker@evil.example")).toBeNull();
+    expect(extractAddress('Name <news@bank.example> "x"')).toBeNull();
+    expect(extractAddress('<"news"@bank.example>')).toBeNull();
+    expect(extractAddress('"news"@bank.example')).toBeNull();
+    expect(extractAddress("<@route.example:news@bank.example>")).toBeNull();
+    expect(extractAddress("<news@[192.0.2.1]>")).toBeNull();
+    expect(extractAddress("<news@bank..example>")).toBeNull();
+    expect(extractAddress("<>")).toBeNull();
+    expect(extractAddress("Name\\ <news@bank.example>")).toBeNull();
+  });
+
+  it("extracts a bare address with comments and surrounding whitespace", () => {
+    expect(extractAddress("  news@bank.example  ")).toBe("news@bank.example");
+    expect(extractAddress("(Bank) news@bank.example (Updates)")).toBe("news@bank.example");
+  });
+
+  it("normalises addresses to lower case", () => {
+    expect(extractAddress("NEWS@Bank.EXAMPLE")).toBe("news@bank.example");
+    expect(extractAddress('"BANK" <News@BANK.Example>')).toBe("news@bank.example");
+  });
 });
 
 describe("parseListUnsubscribe", () => {
@@ -257,6 +321,36 @@ describe("analyzeUnsubscribe", () => {
     const a = analyzeUnsubscribe(buildHeaders({ from: "Bank <alerts@mybank.com>" }));
     expect(a.methods).toEqual([]);
     expect(a.ineligible[0].reason).toBe("no passing DKIM signature aligned with mybank.com");
+  });
+
+  it("aligns DKIM with the real sender, not an address in the display name", () => {
+    // The hidden address matches the signer, but the real sender doesn't
+    const spoofed = analyzeUnsubscribe(
+      buildHeaders({ from: '"<toktok@info.glovoapp.com> Glovo" <attacker@evil.example>' })
+    );
+    expect(spoofed.fromDomain).toBe("evil.example");
+    expect(spoofed.dkim.verified).toBe(false);
+    expect(spoofed.methods).toEqual([]);
+    expect(spoofed.ineligible[0].reason).toBe(
+      "no passing DKIM signature aligned with evil.example"
+    );
+
+    // The real sender is the signer; the hidden address is ignored
+    const real = analyzeUnsubscribe(
+      buildHeaders({ from: '"<news@bank.example> Updates" <toktok@info.glovoapp.com>' })
+    );
+    expect(real.fromDomain).toBe("info.glovoapp.com");
+    expect(real.dkim.domain).toBe("info.glovoapp.com");
+    expect(real.methods).toEqual(["one-click", "mailto", "web"]);
+  });
+
+  it("refuses a From header with several mailboxes", () => {
+    const a = analyzeUnsubscribe(
+      buildHeaders({ from: '"Glovo" <toktok@info.glovoapp.com>, "Other" <attacker@evil.example>' })
+    );
+    expect(a.fromDomain).toBeNull();
+    expect(a.methods).toEqual([]);
+    expect(a.ineligible[0].reason).toBe("From address could not be parsed");
   });
 
   it("refuses when List-Unsubscribe isn't signed", () => {
