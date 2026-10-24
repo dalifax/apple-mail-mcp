@@ -261,12 +261,220 @@ function buildAppLevelScript(command: string): string {
  */
 const MAILBOX_ALIASES: Record<string, string[]> = {
   inbox: ["INBOX", "Inbox", "inbox"],
-  sent: ["Sent", "Sent Items", "Sent Messages", "SENT", "sent"],
+  sent: ["Sent", "Sent Items", "Sent Messages", "Sent Mail", "SENT", "sent"],
   drafts: ["Drafts", "DRAFTS", "drafts", "Draft"],
   trash: ["Trash", "Deleted Items", "Deleted Messages", "TRASH", "trash"],
   junk: ["Junk", "Junk Email", "Spam", "JUNK", "junk"],
   archive: ["Archive", "ARCHIVE", "archive", "All Mail"],
 };
+
+/** Separator between parent and child names in a mailbox path, e.g. "[Gmail]/All Mail". */
+const MAILBOX_PATH_SEPARATOR = "/";
+
+/**
+ * Builds an AppleScript reference to a mailbox from its path.
+ *
+ * Nested mailboxes can't be addressed by name alone: Gmail's system folders
+ * live under "[Gmail]", and `mailbox "All Mail" of account "Google"` fails
+ * with -1728 even though `name of every mailbox` lists "All Mail".
+ *
+ * @param path - Mailbox path, e.g. "INBOX" or "[Gmail]/All Mail"
+ * @param account - Account to qualify the reference with; omit inside `tell account`
+ * @returns e.g. `mailbox "All Mail" of mailbox "[Gmail]" of account "Google"`
+ */
+export function buildMailboxReference(path: string, account?: string): string {
+  const refs = path
+    .split(MAILBOX_PATH_SEPARATOR)
+    .reverse()
+    .map((name) => `mailbox "${escapeForAppleScript(name)}"`);
+  if (account) refs.push(`account "${escapeForAppleScript(account)}"`);
+  return refs.join(" of ");
+}
+
+/** The last component of a mailbox path ("[Gmail]/All Mail" -> "All Mail"). */
+function mailboxLeafName(path: string): string {
+  const parts = path.split(MAILBOX_PATH_SEPARATOR);
+  return parts[parts.length - 1];
+}
+
+/**
+ * Finds the mailbox path an account uses for a requested mailbox name.
+ *
+ * Tries, in order: exact path, case-insensitive path, then the same against
+ * leaf names (so "All Mail" finds "[Gmail]/All Mail"), then known aliases
+ * (e.g. "Sent" -> "Sent Items"). Shallower mailboxes win when leaf names clash.
+ *
+ * @param requested - Mailbox name or path from the caller
+ * @param paths - All mailbox paths in the account
+ * @returns The matching path, or undefined if nothing matches
+ */
+export function matchMailboxPath(requested: string, paths: string[]): string | undefined {
+  const byDepth = [...paths].sort(
+    (a, b) => a.split(MAILBOX_PATH_SEPARATOR).length - b.split(MAILBOX_PATH_SEPARATOR).length
+  );
+  const find = (name: string): string | undefined => {
+    const lower = name.toLowerCase();
+    return (
+      byDepth.find((p) => p === name) ??
+      byDepth.find((p) => p.toLowerCase() === lower) ??
+      byDepth.find((p) => mailboxLeafName(p) === name) ??
+      byDepth.find((p) => mailboxLeafName(p).toLowerCase() === lower)
+    );
+  };
+
+  const direct = find(requested);
+  if (direct) return direct;
+
+  for (const alias of MAILBOX_ALIASES[requested.toLowerCase()] ?? []) {
+    const match = find(alias);
+    if (match) return match;
+  }
+  return undefined;
+}
+
+/**
+ * Parses listMailboxes() output: "path|||unread|||total" items joined by
+ * "|||ITEM|||", where unread and total are empty when counting failed.
+ */
+export function parseMailboxList(output: string, account: string): Mailbox[] {
+  return output.split("|||ITEM|||").flatMap((item) => {
+    const [name, unread, total] = item.split("|||");
+    if (!name?.trim()) return [];
+    const mailbox: Mailbox = { name: name.trim(), account };
+    if (unread && total) {
+      mailbox.unreadCount = parseInt(unread) || 0;
+      mailbox.messageCount = parseInt(total) || 0;
+    }
+    return [mailbox];
+  });
+}
+
+/** Top-level folder holding Gmail's system mailboxes ("[Google Mail]" in some regions). */
+const GMAIL_SYSTEM_FOLDERS = ["[Gmail]", "[Google Mail]"];
+
+/**
+ * Whether an account's mailbox paths look like a Gmail account.
+ */
+export function isGmailMailboxList(paths: string[]): boolean {
+  return paths.some((p) =>
+    GMAIL_SYSTEM_FOLDERS.some((folder) => p.startsWith(folder + MAILBOX_PATH_SEPARATOR))
+  );
+}
+
+/**
+ * Whether `path` is Gmail's All Mail folder, i.e. a move there means "archive".
+ */
+export function isGmailAllMail(path: string): boolean {
+  return GMAIL_SYSTEM_FOLDERS.some(
+    (folder) => path === `${folder}${MAILBOX_PATH_SEPARATOR}All Mail`
+  );
+}
+
+/**
+ * Builds AppleScript that finds message `id`, binds it to `msg`, runs
+ * `operation`, and returns "ok" or "error:<reason>".
+ *
+ * Mailboxes in `preferredMailboxes` (full references) are checked first; then
+ * every mailbox of every account. Lookups by id are cheap even in Gmail's All
+ * Mail, but each mailbox costs an Apple Event, so a good first guess helps.
+ */
+export function buildFindMessage(
+  id: number,
+  operation: string,
+  preferredMailboxes: string[] = []
+): string {
+  const preferred = preferredMailboxes
+    .map(
+      (ref) => `
+        if msg is missing value then
+          try
+            set matchingMsgs to (messages of ${ref} whose id is ${id})
+            if (count of matchingMsgs) > 0 then set msg to item 1 of matchingMsgs
+          end try
+        end if`
+    )
+    .join("");
+
+  return `
+      try
+        set msg to missing value${preferred}
+        if msg is missing value then
+          repeat with acct in accounts
+            repeat with mb in mailboxes of acct
+              try
+                set matchingMsgs to (messages of mb whose id is ${id})
+                if (count of matchingMsgs) > 0 then
+                  set msg to item 1 of matchingMsgs
+                  exit repeat
+                end if
+              end try
+            end repeat
+            if msg is not missing value then exit repeat
+          end repeat
+        end if
+        if msg is missing value then return "error:Message not found"
+        ${operation}
+        return "ok"
+      on error errMsg
+        return "error:" & errMsg
+      end try
+    `;
+}
+
+/**
+ * Why moving to Gmail's All Mail is refused.
+ *
+ * Mail.app files a Gmail message under All Mail even when it's reached through
+ * INBOX (`mailbox of msg` is All Mail), so a scripted move to All Mail is a
+ * no-op on the server: Gmail keeps the INBOX label and the message reappears
+ * on the next sync.
+ *
+ * Setting `deleted status` on the INBOX copy isn't a workaround either: Mail
+ * handles it as delete-to-Trash (`deleteMessages:moveToTrash:`), and on
+ * macOS 26.6 / Mail 16.0 it crashed Mail.app without changing the server
+ * (tested 2026-09-29). Mail's dictionary has no archive command.
+ */
+export const GMAIL_ARCHIVE_UNSUPPORTED =
+  "Archiving to Gmail's All Mail through Mail.app isn't supported: Gmail keeps the INBOX label, " +
+  "so the message returns to the inbox on the next sync. Archive it in Gmail instead.";
+
+/**
+ * AppleScript that sets `mbPath` to the path of mailbox `mb` by walking its
+ * containers. Nested mailboxes report class `container`, and a top-level
+ * mailbox's container is its account, which ends the walk.
+ */
+const AS_MAILBOX_PATH = `
+        set mbPath to name of mb
+        set p to contents of mb
+        repeat 20 times
+          set parentName to missing value
+          try
+            set p to container of p
+            if class of p is in {mailbox, container} then set parentName to name of p
+          end try
+          if parentName is missing value then exit repeat
+          set mbPath to parentName & "${MAILBOX_PATH_SEPARATOR}" & mbPath
+        end repeat`;
+
+/**
+ * AppleScript that sets `mbUnread` and `mbTotal` for mailbox `mb`.
+ *
+ * Fetches every read status in one Apple Event and counts "false" in the
+ * joined text. `count of (messages whose read status is false)` took 65 s on
+ * a 3,000-message Gmail INBOX and timed out on All Mail; this takes ~5 s for
+ * 68,000 messages. Mail's `unread count` property is cheap but wrong for IMAP.
+ */
+const AS_MAILBOX_COUNTS = `
+        set readFlags to read status of messages of mb
+        set mbTotal to count of readFlags
+        set mbUnread to 0
+        if mbTotal > 0 then
+          set AppleScript's text item delimiters to ","
+          set flagText to readFlags as text
+          set AppleScript's text item delimiters to "false"
+          set mbUnread to (count of text items of flagText) - 1
+          set AppleScript's text item delimiters to ""
+        end if`;
 
 // =============================================================================
 // Apple Mail Manager Class
@@ -293,12 +501,12 @@ export class AppleMailManager {
 
   /**
    * TTL cache for expensive AppleScript queries that rarely change.
-   * Caches account list and per-account mailbox names to avoid
+   * Caches account list and per-account mailbox paths to avoid
    * redundant AppleScript roundtrips on every tool call.
    */
   private cache = {
     accounts: null as { data: Account[]; expiry: number } | null,
-    mailboxNames: new Map<string, { data: string[]; expiry: number }>(),
+    mailboxPaths: new Map<string, { data: string[]; expiry: number }>(),
   };
 
   /** Cache TTL in milliseconds (60 seconds). */
@@ -318,19 +526,19 @@ export class AppleMailManager {
   }
 
   /**
-   * Returns cached mailbox names for an account, or fetches fresh.
-   * This caches only the name list used by resolveMailbox(), not the
+   * Returns cached mailbox paths for an account, or fetches fresh.
+   * This caches only the path list used by resolveMailbox(), not the
    * full Mailbox objects with counts (which change frequently).
    */
-  private getCachedMailboxNames(account: string): string[] {
+  private getCachedMailboxPaths(account: string): string[] {
     const now = Date.now();
-    const cached = this.cache.mailboxNames.get(account);
+    const cached = this.cache.mailboxPaths.get(account);
     if (cached && now < cached.expiry) {
       return cached.data;
     }
-    const names = this.fetchMailboxNames(account);
-    this.cache.mailboxNames.set(account, { data: names, expiry: now + this.CACHE_TTL_MS });
-    return names;
+    const paths = this.fetchMailboxPaths(account);
+    this.cache.mailboxPaths.set(account, { data: paths, expiry: now + this.CACHE_TTL_MS });
+    return paths;
   }
 
   /**
@@ -339,7 +547,7 @@ export class AppleMailManager {
    */
   private invalidateCache(): void {
     this.cache.accounts = null;
-    this.cache.mailboxNames.clear();
+    this.cache.mailboxPaths.clear();
   }
 
   /**
@@ -388,58 +596,24 @@ export class AppleMailManager {
   }
 
   /**
-   * Resolves a mailbox name to its actual name in the account.
+   * Resolves a mailbox name to its path in the account.
    *
    * Different account types (IMAP, Exchange, iCloud) use different
    * mailbox naming conventions:
-   * - IMAP/Gmail: "INBOX", "Sent", "Drafts"
+   * - Gmail: "INBOX", "[Gmail]/Sent Mail", "[Gmail]/All Mail"
    * - Exchange: "Inbox", "Sent Items", "Deleted Items"
    * - iCloud: "INBOX", "Sent", "Trash"
    *
-   * This method tries to find a matching mailbox by:
-   * 1. Exact match
-   * 2. Case-insensitive match
-   * 3. Known aliases (e.g., "Sent" -> "Sent Items")
+   * See matchMailboxPath() for the matching rules. Pass the result to
+   * buildMailboxReference() rather than `mailbox "..."`, since it may be nested.
    *
-   * @param mailbox - Requested mailbox name
+   * @param mailbox - Requested mailbox name or path
    * @param account - Account to search in
-   * @returns Actual mailbox name, or original if not found
+   * @returns Mailbox path, or the original name if not found
    */
   private resolveMailbox(mailbox: string, account: string): string {
-    const actualMailboxes = this.getCachedMailboxNames(account);
-    if (actualMailboxes.length === 0) {
-      return mailbox; // Fall back to original
-    }
-
-    // 1. Try exact match
-    if (actualMailboxes.includes(mailbox)) {
-      return mailbox;
-    }
-
-    // 2. Try case-insensitive match
-    const lowerMailbox = mailbox.toLowerCase();
-    const caseMatch = actualMailboxes.find((mb) => mb.toLowerCase() === lowerMailbox);
-    if (caseMatch) {
-      return caseMatch;
-    }
-
-    // 3. Try known aliases
-    const aliases = MAILBOX_ALIASES[lowerMailbox];
-    if (aliases) {
-      for (const alias of aliases) {
-        if (actualMailboxes.includes(alias)) {
-          return alias;
-        }
-        // Also try case-insensitive alias match
-        const aliasMatch = actualMailboxes.find((mb) => mb.toLowerCase() === alias.toLowerCase());
-        if (aliasMatch) {
-          return aliasMatch;
-        }
-      }
-    }
-
-    // No match found, return original and let AppleScript handle the error
-    return mailbox;
+    // No match: return the original and let AppleScript report the error
+    return matchMailboxPath(mailbox, this.getCachedMailboxPaths(account)) ?? mailbox;
   }
 
   /**
@@ -447,11 +621,8 @@ export class AppleMailManager {
    * Assumes it does when the mailbox list can't be fetched.
    */
   private hasMailbox(mailbox: string, account: string): boolean {
-    const actualMailboxes = this.getCachedMailboxNames(account);
-    return (
-      actualMailboxes.length === 0 ||
-      actualMailboxes.includes(this.resolveMailbox(mailbox, account))
-    );
+    const paths = this.getCachedMailboxPaths(account);
+    return paths.length === 0 || matchMailboxPath(mailbox, paths) !== undefined;
   }
 
   // ===========================================================================
@@ -508,7 +679,7 @@ export class AppleMailManager {
 
       searchCommand = `
       ${dateRange.setup}
-      set theMailbox to mailbox "${escapeForAppleScript(targetMailbox)}"
+      set theMailbox to ${buildMailboxReference(targetMailbox)}
       ${buildBulkMessageFetch(whoseClause, 0, limit)}
     `;
     } else {
@@ -711,7 +882,7 @@ export class AppleMailManager {
       const targetMailbox = this.resolveMailbox(mailbox, targetAccount);
 
       listCommand = `
-      set theMailbox to mailbox "${escapeForAppleScript(targetMailbox)}"
+      set theMailbox to ${buildMailboxReference(targetMailbox)}
       ${buildBulkMessageFetch(whoseClause, offset, limit)}
     `;
     } else {
@@ -1114,27 +1285,18 @@ export class AppleMailManager {
 
   /**
    * Helper to find and operate on a message by ID.
+   *
+   * Looks in `preferredMailboxes` (full AppleScript references) first, then
+   * scans every mailbox of every account. `operation` runs once, outside the
+   * per-mailbox `try`, so its errors are reported instead of being mistaken
+   * for "Message not found".
    */
-  private findMessageScript(id: string, operation: string): string {
-    return buildAppLevelScript(`
-      try
-        repeat with acct in accounts
-          repeat with mb in mailboxes of acct
-            try
-              set matchingMsgs to (messages of mb whose id is ${Number(id)})
-              if (count of matchingMsgs) > 0 then
-                set msg to item 1 of matchingMsgs
-                ${operation}
-                return "ok"
-              end if
-            end try
-          end repeat
-        end repeat
-        return "error:Message not found"
-      on error errMsg
-        return "error:" & errMsg
-      end try
-    `);
+  private findMessageScript(
+    id: string,
+    operation: string,
+    preferredMailboxes: string[] = []
+  ): string {
+    return buildAppLevelScript(buildFindMessage(Number(id), operation, preferredMailboxes));
   }
 
   /**
@@ -1213,35 +1375,49 @@ export class AppleMailManager {
   }
 
   /**
+   * Resolves a move destination and rejects moves that wouldn't reach the server.
+   *
+   * @throws Error if the mailbox doesn't exist, or it is Gmail's All Mail
+   */
+  private resolveMoveDestination(
+    mailbox: string,
+    account?: string
+  ): { account: string; path: string; inboxPath: string } {
+    const targetAccount = this.resolveAccount(account);
+    const paths = this.getCachedMailboxPaths(targetAccount);
+    const path = matchMailboxPath(mailbox, paths);
+    if (paths.length > 0 && !path) {
+      throw new Error(`Mailbox "${mailbox}" not found in account "${targetAccount}"`);
+    }
+    if (path && isGmailMailboxList(paths) && isGmailAllMail(path)) {
+      throw new Error(GMAIL_ARCHIVE_UNSUPPORTED);
+    }
+    return {
+      account: targetAccount,
+      path: path ?? mailbox,
+      inboxPath: matchMailboxPath("INBOX", paths) ?? "INBOX",
+    };
+  }
+
+  /**
    * Move a message to a different mailbox.
+   *
+   * @throws Error if the destination doesn't exist or is Gmail's All Mail
    */
   moveMessage(id: string, mailbox: string, account?: string): boolean {
-    const targetAccount = this.resolveAccount(account);
-    const targetMailbox = this.resolveMailbox(mailbox, targetAccount);
-    const safeMailbox = escapeForAppleScript(targetMailbox);
-    const safeAccount = escapeForAppleScript(targetAccount);
+    return this.moveToDestination(id, this.resolveMoveDestination(mailbox, account));
+  }
 
-    const script = buildAppLevelScript(`
-      try
-        repeat with acct in accounts
-          repeat with mb in mailboxes of acct
-            try
-              set matchingMsgs to (messages of mb whose id is ${Number(id)})
-              if (count of matchingMsgs) > 0 then
-                set msg to item 1 of matchingMsgs
-                set destMailbox to mailbox "${safeMailbox}" of account "${safeAccount}"
-                move msg to destMailbox
-                return "ok"
-              end if
-            end try
-          end repeat
-        end repeat
-        return "error:Message not found"
-      on error errMsg
-        return "error:" & errMsg
-      end try
-    `);
-
+  private moveToDestination(
+    id: string,
+    dest: { account: string; path: string; inboxPath: string }
+  ): boolean {
+    // Most moves are out of the destination account's INBOX, so look there before scanning.
+    const script = this.findMessageScript(
+      id,
+      `move msg to ${buildMailboxReference(dest.path, dest.account)}`,
+      [buildMailboxReference(dest.inboxPath, dest.account)]
+    );
     const result = executeAppleScript(script, { timeoutMs: 60000 });
 
     if (!result.success || result.output.startsWith("error:")) {
@@ -1284,12 +1460,14 @@ export class AppleMailManager {
    * @param mailbox - Destination mailbox name
    * @param account - Account containing the destination mailbox
    * @returns Array of results for each message
+   * @throws Error if the destination doesn't exist or is Gmail's All Mail
    */
   batchMoveMessages(ids: string[], mailbox: string, account?: string): BatchOperationResult[] {
+    const dest = this.resolveMoveDestination(mailbox, account);
     const results: BatchOperationResult[] = [];
 
     for (const id of ids) {
-      const success = this.moveMessage(id, mailbox, account);
+      const success = this.moveToDestination(id, dest);
       results.push({
         id,
         success,
@@ -1477,48 +1655,60 @@ export class AppleMailManager {
 
   /**
    * List all mailboxes for an account.
+   *
+   * Nested mailboxes are named by path (e.g. "[Gmail]/All Mail"), which other
+   * mailbox parameters accept. When `includeCounts` is false, or counting
+   * fails (e.g. times out on a very large mailbox), mailboxes are returned
+   * without counts rather than not at all.
+   *
+   * @param account - Account to list (default account if omitted)
+   * @param includeCounts - Count total and unread messages (default true)
+   * @returns Mailboxes; counts are undefined where they weren't available
    */
-  listMailboxes(account?: string): Mailbox[] {
+  listMailboxes(account?: string, includeCounts = true): Mailbox[] {
     const targetAccount = this.resolveAccount(account);
+    const namesOnly = (): Mailbox[] =>
+      this.getCachedMailboxPaths(targetAccount).map((name) => ({ name, account: targetAccount }));
 
+    if (!includeCounts) {
+      const mailboxes = namesOnly();
+      if (mailboxes.length === 0) {
+        throw new Error(`Failed to list mailboxes for account "${targetAccount}"`);
+      }
+      return mailboxes;
+    }
+
+    // Each mailbox's counts are in their own try, so one failure only drops that mailbox's counts.
     const listCommand = `
       set mailboxList to {}
       repeat with mb in mailboxes
-        set mbName to name of mb
-        set mbUnread to count of (messages of mb whose read status is false)
-        set mbCount to count of messages of mb
-        set end of mailboxList to mbName & "|||" & mbUnread & "|||" & mbCount
+        ${AS_MAILBOX_PATH}
+        set countText to ""
+        try
+          ${AS_MAILBOX_COUNTS}
+          set countText to (mbUnread as string) & "|||" & (mbTotal as string)
+        end try
+        set end of mailboxList to mbPath & "|||" & countText
       end repeat
       set AppleScript's text item delimiters to "|||ITEM|||"
       return mailboxList as text
     `;
 
     const script = buildAccountScopedScript(targetAccount, listCommand);
-    const result = executeAppleScript(script);
+    const result = executeAppleScript(script, { timeoutMs: 60000 });
 
     if (!result.success) {
-      console.error(`Failed to list mailboxes: ${result.error}`);
-      return [];
+      console.error(`Failed to count mailboxes, listing names only: ${result.error}`);
+      const mailboxes = namesOnly();
+      if (mailboxes.length === 0) {
+        throw new Error(`Failed to list mailboxes: ${result.error}`);
+      }
+      return mailboxes;
     }
 
     if (!result.output.trim()) return [];
 
-    const items = result.output.split("|||ITEM|||");
-    const mailboxes: Mailbox[] = [];
-
-    for (const item of items) {
-      const parts = item.split("|||");
-      if (parts.length < 3) continue;
-
-      mailboxes.push({
-        name: parts[0],
-        account: targetAccount,
-        unreadCount: parseInt(parts[1]) || 0,
-        messageCount: parseInt(parts[2]) || 0,
-      });
-    }
-
-    return mailboxes;
+    return parseMailboxList(result.output, targetAccount);
   }
 
   /**
@@ -1534,21 +1724,28 @@ export class AppleMailManager {
     let command: string;
     if (mailbox) {
       const targetMailbox = this.resolveMailbox(mailbox, targetAccount);
-      const safeMailbox = escapeForAppleScript(targetMailbox);
-      command = `return count of (messages of mailbox "${safeMailbox}" whose read status is false)`;
+      command = `
+        set mb to ${buildMailboxReference(targetMailbox)}
+        ${AS_MAILBOX_COUNTS}
+        return mbUnread
+      `;
     } else {
       // Get total unread across all mailboxes
       command = `
         set total to 0
         repeat with mb in mailboxes
-          set total to total + (count of (messages of mb whose read status is false))
+          -- Some mailboxes (e.g. iCloud's Notes) can't list their messages
+          try
+            ${AS_MAILBOX_COUNTS}
+            set total to total + mbUnread
+          end try
         end repeat
         return total
       `;
     }
 
     const script = buildAccountScopedScript(targetAccount, command);
-    const result = executeAppleScript(script);
+    const result = executeAppleScript(script, { timeoutMs: 60000 });
 
     if (!result.success) {
       throw new Error(`Failed to get unread count: ${result.error}`);
@@ -1591,12 +1788,10 @@ export class AppleMailManager {
   deleteMailbox(name: string, account?: string): boolean {
     const targetAccount = this.resolveAccount(account);
     const targetMailbox = this.resolveMailbox(name, targetAccount);
-    const safeName = escapeForAppleScript(targetMailbox);
-    const safeAccount = escapeForAppleScript(targetAccount);
 
     const script = buildAppLevelScript(`
       try
-        delete mailbox "${safeName}" of account "${safeAccount}"
+        delete ${buildMailboxReference(targetMailbox, targetAccount)}
         return "ok"
       on error errMsg
         return "error:" & errMsg
@@ -1626,20 +1821,23 @@ export class AppleMailManager {
     }
 
     // Move all messages from old to new
-    const resolvedOld = this.resolveMailbox(oldName, targetAccount);
-    const resolvedNew = this.resolveMailbox(newName, targetAccount);
-    const safeOld = escapeForAppleScript(resolvedOld);
-    const safeNew = escapeForAppleScript(resolvedNew);
-    const safeAccount = escapeForAppleScript(targetAccount);
+    const oldRef = buildMailboxReference(
+      this.resolveMailbox(oldName, targetAccount),
+      targetAccount
+    );
+    const newRef = buildMailboxReference(
+      this.resolveMailbox(newName, targetAccount),
+      targetAccount
+    );
 
     const moveScript = buildAppLevelScript(`
       try
-        set srcMailbox to mailbox "${safeOld}" of account "${safeAccount}"
-        set destMailbox to mailbox "${safeNew}" of account "${safeAccount}"
+        set srcMailbox to ${oldRef}
+        set destMailbox to ${newRef}
         repeat with msg in messages of srcMailbox
           move msg to destMailbox
         end repeat
-        delete mailbox "${safeOld}" of account "${safeAccount}"
+        delete ${oldRef}
         return "ok"
       on error errMsg
         return "error:" & errMsg
@@ -1716,18 +1914,20 @@ export class AppleMailManager {
   }
 
   /**
-   * Fetches mailbox names for an account directly from Mail.app.
-   * Used internally by the cache; prefer getCachedMailboxNames().
+   * Fetch mailbox paths for an account directly from Mail.app.
+   * Used internally by the cache; prefer getCachedMailboxPaths().
    */
-  private fetchMailboxNames(account: string): string[] {
+  private fetchMailboxPaths(account: string): string[] {
     const script = buildAccountScopedScript(
       account,
       `
-      set mbNames to {}
+      set mbPaths to {}
       repeat with mb in mailboxes
-        set end of mbNames to name of mb
+        ${AS_MAILBOX_PATH}
+        set end of mbPaths to mbPath
       end repeat
-      return mbNames
+      set AppleScript's text item delimiters to "|||ITEM|||"
+      return mbPaths as text
     `
     );
 
@@ -1736,7 +1936,7 @@ export class AppleMailManager {
       return [];
     }
 
-    return result.output.split(", ").map((s) => s.trim());
+    return result.output.split("|||ITEM|||").map((s) => s.trim());
   }
 
   // ===========================================================================
@@ -2037,13 +2237,11 @@ export class AppleMailManager {
       let accountUnread = 0;
 
       const mailboxStats = mailboxes.map((mb) => {
-        accountMessages += mb.messageCount;
-        accountUnread += mb.unreadCount;
-        return {
-          name: mb.name,
-          messageCount: mb.messageCount,
-          unreadCount: mb.unreadCount,
-        };
+        const messageCount = mb.messageCount ?? 0;
+        const unreadCount = mb.unreadCount ?? 0;
+        accountMessages += messageCount;
+        accountUnread += unreadCount;
+        return { name: mb.name, messageCount, unreadCount };
       });
 
       totalMessages += accountMessages;
