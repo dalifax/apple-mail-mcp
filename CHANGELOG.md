@@ -9,9 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Unsubscribe tools** — `get-unsubscribe-info` (read-only) and `unsubscribe-message` use a message's List-Unsubscribe headers: RFC 8058 one-click POST first, then a mailto email. Every method requires a passing, From-aligned DKIM signature from a trusted receiver (iCloud or Gmail) that covers the unsubscribe headers. Both tools accept a Mail.app message ID or a raw message file (`.eml`, or JSON with a base64url `raw` field such as a Gmail API RAW response), so the same logic works for any inbox.
+- **`includeCounts` on list-mailboxes** — `false` gives a fast name-only listing.
 
 ### Changed
 - `withErrorHandling` now accepts async handlers.
+- **Gmail archive is refused** — Moving a Gmail message to `All Mail` (or `archive`) now returns an error. Before, it moved only Mail.app's local copy: Mail files every Gmail message under All Mail, so the move did nothing on the server, and the message returned to the inbox on the next sync. Setting `deleted status` on the INBOX copy doesn't work either. Mail treats it as delete-to-Trash, and in testing it crashed Mail.app.
+
+### Fixed
+- **list-mailboxes on Gmail** — Counting unread messages with `whose read status is false` took over a minute for a 3,000-message INBOX and timed out on `[Gmail]/All Mail`, so the tool reported "No mailboxes found". Counts now come from one bulk read-status fetch per mailbox (about 5 s for 68,000 messages). If counting still fails, mailboxes are listed without counts. `get-unread-count` uses the same method.
+- **Nested mailboxes** — Gmail's system folders live under `[Gmail]`, and `mailbox "All Mail" of account "Google"` fails with -1728. Mailboxes are now resolved to paths (`[Gmail]/All Mail`) and addressed through their parents. Plain names, paths, and aliases all resolve. `Sent Mail` was added to the `sent` aliases.
+- **move-message / batch-move-messages** — An error from the move itself, such as an invalid destination, was reported as "Message not found" after scanning every mailbox. The message is now looked up first (in the destination account's INBOX, then everywhere else), and move errors are reported as they are. An unknown destination mailbox is rejected before anything runs.
 
 ## [1.4.0] - 2026-04-03
 

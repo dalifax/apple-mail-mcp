@@ -341,8 +341,10 @@ Move a message to a different mailbox.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `id` | string | Yes | Message ID |
-| `mailbox` | string | Yes | Destination mailbox |
+| `mailbox` | string | Yes | Destination mailbox (name or path, e.g. `Spam` or `[Gmail]/Spam`) |
 | `account` | string | No | Account containing mailbox |
+
+**Gmail:** moving to `All Mail` (or `archive`) returns an error instead of moving. Mail.app can't archive Gmail messages by script: the INBOX label stays on the server, so the message comes back on the next sync. Archive in Gmail instead.
 
 ---
 
@@ -409,7 +411,7 @@ All batch operations accept an array of message IDs (max 100 per batch) and retu
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `ids` | string[] | Yes | Message IDs to move (max 100) |
-| `mailbox` | string | Yes | Destination mailbox |
+| `mailbox` | string | Yes | Destination mailbox (same rules as `move-message`) |
 | `account` | string | No | Account containing mailbox |
 
 #### `batch-mark-as-read` / `batch-mark-as-unread`
@@ -435,8 +437,9 @@ List all mailboxes for an account.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `account` | string | No | Account to list from |
+| `includeCounts` | boolean | No | Count unread and total messages (default: true); `false` lists names only |
 
-**Returns:** List of mailbox names with message and unread counts.
+**Returns:** List of mailboxes with unread and total counts. Nested mailboxes are shown by path (e.g. `[Gmail]/All Mail`). If Mail.app can't count a mailbox in time, it's listed without counts.
 
 ---
 

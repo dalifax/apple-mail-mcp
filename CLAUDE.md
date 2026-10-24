@@ -109,6 +109,12 @@ The `to`, `cc`, and `bcc` parameters must always be arrays:
 - Set `send: false` to save as draft
 - Uses `without opening window` internally — same background-process fix as reply-to-message
 
+### Mailboxes and Gmail
+
+- `list-mailboxes` names nested mailboxes by path, e.g. `[Gmail]/All Mail`. Mailbox parameters accept the path, the plain name (`All Mail`), or an alias (`archive`, `sent`, `trash`, `junk`)
+- Pass `includeCounts: false` to `list-mailboxes` for a fast name-only listing
+- **Gmail archive isn't supported.** `move-message` / `batch-move-messages` to `All Mail` returns an error. Mail.app files every Gmail message under All Mail, so a scripted move there never reaches the server and Gmail keeps the INBOX label. Tell the user to archive in Gmail. Flag changes do sync (as stars)
+
 ### get-unsubscribe-info / unsubscribe-message
 
 - Check first: `get-unsubscribe-info id="..."` lists methods in order (one-click, mailto, web) and why any are unavailable

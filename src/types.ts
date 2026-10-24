@@ -89,17 +89,17 @@ export interface MessageContent {
  * Represents a mailbox (folder) in Apple Mail.
  */
 export interface Mailbox {
-  /** Display name of the mailbox */
+  /** Mailbox path; nested mailboxes use "/" (e.g. "[Gmail]/All Mail") */
   name: string;
 
   /** Account containing the mailbox */
   account: string;
 
-  /** Number of unread messages */
-  unreadCount: number;
+  /** Number of unread messages (undefined when counts were skipped or failed) */
+  unreadCount?: number;
 
-  /** Total number of messages */
-  messageCount: number;
+  /** Total number of messages (undefined when counts were skipped or failed) */
+  messageCount?: number;
 }
 
 /**

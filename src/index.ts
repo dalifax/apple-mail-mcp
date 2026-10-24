@@ -802,17 +802,36 @@ server.tool(
   "list-mailboxes",
   {
     account: z.string().optional().describe("Account to list mailboxes from"),
+    includeCounts: z
+      .boolean()
+      .optional()
+      .describe(
+        "Count unread and total messages per mailbox (default: true). Set false for a fast name-only listing."
+      ),
   },
-  withErrorHandling(({ account }) => {
-    const mailboxes = mailManager.listMailboxes(account);
+  withErrorHandling(({ account, includeCounts }) => {
+    const countsRequested = includeCounts ?? true;
+    const mailboxes = mailManager.listMailboxes(account, countsRequested);
 
     if (mailboxes.length === 0) {
       return successResponse("No mailboxes found");
     }
 
-    const mailboxList = mailboxes.map((m) => `  - ${m.name} (${m.unreadCount} unread)`).join("\n");
+    const mailboxList = mailboxes
+      .map((m) =>
+        m.unreadCount === undefined
+          ? `  - ${m.name}`
+          : `  - ${m.name} (${m.unreadCount} unread, ${m.messageCount} total)`
+      )
+      .join("\n");
+    const missingCounts =
+      countsRequested && mailboxes.some((m) => m.unreadCount === undefined)
+        ? "\n\nCounts unavailable for mailboxes listed without them (Mail.app could not count them in time)."
+        : "";
 
-    return successResponse(`Found ${mailboxes.length} mailbox(es):\n${mailboxList}`);
+    return successResponse(
+      `Found ${mailboxes.length} mailbox(es):\n${mailboxList}${missingCounts}`
+    );
   }, "Error listing mailboxes")
 );
 
