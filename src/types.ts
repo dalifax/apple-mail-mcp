@@ -439,6 +439,23 @@ export interface BatchOperationResult {
 // =============================================================================
 
 /**
+ * Raw headers of a message, with the account it belongs to.
+ */
+export interface MessageHeaders {
+  /** Message ID */
+  id: string;
+
+  /** Name of the account containing the message */
+  account: string;
+
+  /** Email addresses configured for that account */
+  accountAddresses: string[];
+
+  /** Raw RFC 822 header block */
+  headers: string;
+}
+
+/**
  * Represents a mail rule in Apple Mail.
  */
 export interface MailRule {
